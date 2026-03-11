@@ -1,0 +1,762 @@
+---
+title: "Econometria Espacial - Violência Ceará (MODIFICADO)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+# Carregamento de bibliotecas
+library(plm)
+library(lmtest)
+library(car)
+library(sandwich)
+library(readxl)
+library(janitor)
+library(dplyr)
+library(spdep)
+library(sf)
+library(stargazer)
+library(splm)
+library(stringi)
+library(viridis)
+library(ggplot2)
+library(MASS)
+library(gridExtra)  # Para combinar gráficos
+
+options(scipen = 999)
+```
+
+# 1. CARREGAMENTO E LIMPEZA DE DADOS
+
+```{r}
+# Ler dados
+dados <- read_excel("Base principal/dados_consolidados_2015-2024_com_cod_mun_ibge.xlsx") %>% 
+  clean_names()
+
+# Renomear colunas
+colnames(dados) <- c("municipio", "ano", "cod", "ifdm", "abandono_em", "letal", 
+                     "pop_total", "pop_jovem", "masc", "fem", "pib_mun",
+                     "pib_pc", "vivos", "emp_jovens", "famílias",
+                     "urb", "divorcio", 'educ', 'desp', 'gov', 'kmsq',
+                     'densp', 'adolescentes', 'fert')
+
+# Converter para caractere e limpar NAs
+dados <- dados %>%
+  mutate(across(-c(municipio, ano), as.character)) %>%
+  mutate(across(-c(municipio, ano), ~na_if(., "na"))) %>%
+  mutate(across(-c(municipio, ano), ~na_if(., "NA"))) %>%
+  mutate(across(-c(municipio, ano), ~na_if(., ""))) %>%
+  mutate(across(-c(municipio, ano), ~as.numeric(gsub(",", ".", .))))
+
+# Filtrar até 2020 e criar variáveis
+dados <- dados %>%
+  filter(ano <= 2020) %>%
+  mutate(
+    pib_pc_mil = (pib_mun * 1000 / pop_total) / 1000,
+    pop_mil = pop_total / 1000,
+    prop_jovem = pop_jovem / pop_total,
+    taxa_emprego = emp_jovens / pop_jovem,
+    bf = famílias / pop_total,
+    homem = ifelse(masc > fem, 1, 0)
+  ) %>%
+  mutate(municipio_clean = toupper(stri_trans_general(municipio, "Latin-ASCII")))
+
+cat("Dados carregados:", nrow(dados), "observações de", n_distinct(dados$municipio), "municípios\n")
+```
+
+```{r}
+
+estatisticas <- dados %>%
+  summarise(
+    media_homic = mean(densp, na.rm = TRUE),
+    dp_homic = sd(densp, na.rm = TRUE),
+    min_homic = min(densp, na.rm = TRUE),
+    max_homic = max(densp, na.rm = TRUE),
+    n = sum(!is.na(densp))
+  )
+
+estatisticas
+```
+
+
+# 2. PREPARAÇÃO ESPACIAL (COM TODOS OS MUNICÍPIOS)
+
+```{r}
+# Carregar shapefile
+mapa_ce <- st_read("CE_Municipios_2024.shp") %>%
+  mutate(cod = as.numeric(CD_MUN),
+         municipio_clean = toupper(stri_trans_general(NM_MUN, "Latin-ASCII"))) %>%
+  arrange(cod)
+
+# Criar matriz de vizinhança PARA TODOS OS MUNICÍPIOS
+nb_ce <- poly2nb(mapa_ce, queen = TRUE)
+listw_ce <- nb2listw(nb_ce, style = "W", zero.policy = TRUE)
+
+cat("Shapefile carregado:", nrow(mapa_ce), "municípios\n")
+cat("Municípios com vizinhos:", sum(card(nb_ce) > 0), "\n")
+```
+
+# 3. ANÁLISE ESPACIAL COMPLETA (TODOS OS MUNICÍPIOS)
+
+## 3.1 Moran's I Global (média do período)
+
+```{r}
+# Agregar dados por município (média)
+dados_medio <- dados %>%
+  group_by(cod) %>%
+  summarise(letal_media = mean(letal, na.rm = TRUE), .groups = "drop") %>%
+  arrange(cod)
+
+# Moran's I global
+moran_geral <- moran.test(dados_medio$letal_media, listw_ce, zero.policy = TRUE)
+cat("\n=== MORAN'S I GLOBAL (Média 2015-2020) ===\n")
+print(moran_geral)
+
+# Gráfico de Moran
+moran.plot(dados_medio$letal_media, listw_ce,
+           labels = FALSE,
+           xlab = "Taxa CVLI (Média)",
+           ylab = "Lag Espacial",
+           main = "Autocorrelação Espacial Global (2015-2020)")
+```
+
+## 3.2 Moran's I por Ano (com gráficos individuais)
+
+```{r}
+cat("\n=== MORAN'S I POR ANO ===\n")
+resultados_moran_anual <- data.frame()
+
+# Calcular Moran I para cada ano
+for (ano_i in 2015:2020) {
+  crime_ano <- dados %>%
+    filter(ano == ano_i) %>%
+    arrange(cod) %>%
+    pull(letal)
+  
+  moran_ano <- moran.test(crime_ano, listw_ce, zero.policy = TRUE)
+  
+  resultados_moran_anual <- rbind(resultados_moran_anual, 
+                            data.frame(ano = ano_i,
+                                     moran_i = moran_ano$estimate[1],
+                                     expectativa = moran_ano$estimate[2],
+                                     variancia = moran_ano$estimate[3],
+                                     p_value = moran_ano$p.value))
+}
+
+print(resultados_moran_anual)
+```
+
+```{r fig.height=12, fig.width=16}
+# GRÁFICOS DE MORAN I PARA CADA ANO (2x3 layout)
+par(mfrow = c(2, 3), mar = c(4, 4, 3, 2))
+
+for (ano_i in 2015:2020) {
+  crime_ano <- dados %>%
+    filter(ano == ano_i) %>%
+    arrange(cod) %>%
+    pull(letal)
+  
+  moran_i_valor <- resultados_moran_anual[resultados_moran_anual$ano == ano_i, "moran_i"]
+  p_valor <- resultados_moran_anual[resultados_moran_anual$ano == ano_i, "p_value"]
+  
+  moran.plot(crime_ano, listw_ce,
+             labels = FALSE,
+             xlab = "Taxa CVLI",
+             ylab = "Lag Espacial",
+             main = sprintf("Moran I = %.3f (p = %.4f)\nAno: %d", 
+                          moran_i_valor, p_valor, ano_i),
+             pch = 16,
+             col = rgb(0, 0, 1, 0.5),
+             quiet = TRUE)
+}
+
+par(mfrow = c(1, 1))
+```
+
+## 3.3 Análise LISA Anual (TODOS OS MUNICÍPIOS)
+
+```{r}
+# Função para calcular LISA com TODOS os municípios
+calcular_lisa_completo <- function(ano_selecionado, dados_ref, mapa_ref, listw_ref) {
+  
+  cat("\n", paste(rep("=", 70), collapse = ""), "\n")
+  cat("ANÁLISE LISA PARA O ANO:", ano_selecionado, "(TODOS OS MUNICÍPIOS)\n")
+  cat(paste(rep("=", 70), collapse = ""), "\n\n")
+  
+  # Filtrar dados do ano específico e ordenar pelo código
+  dados_ano <- dados_ref %>%
+    filter(ano == ano_selecionado) %>%
+    arrange(cod)
+  
+  # Criar match perfeito com mapa
+  mapa_ano <- mapa_ref %>%
+    left_join(dados_ano, by = c("cod", "municipio_clean"))
+  
+  # Usar apenas municípios com dados disponíveis
+  dados_validos <- !is.na(mapa_ano$letal)
+  
+  cat("Total de municípios no shapefile:", nrow(mapa_ano), "\n")
+  cat("Municípios com dados válidos:", sum(dados_validos), "\n")
+  cat("Municípios sem dados:", sum(!dados_validos), "\n\n")
+  
+  # Calcular LISA apenas para municípios com dados
+  lisa <- localmoran(mapa_ano$letal[dados_validos], 
+                     listw_ref, 
+                     zero.policy = TRUE,
+                     na.action = na.exclude)
+  
+  # Criar classificação LISA
+  significancia <- lisa[, 5] < 0.05  # p-value
+  desvio <- scale(mapa_ano$letal[dados_validos])
+  lag_espacial <- scale(lag.listw(listw_ref, mapa_ano$letal[dados_validos]))
+  
+  # Classificação dos quadrantes
+  quadrante <- rep(NA, nrow(mapa_ano))
+  quadrante[dados_validos] <- ifelse(desvio > 0 & lag_espacial > 0, "HH", 
+                                      ifelse(desvio < 0 & lag_espacial < 0, "LL",
+                                             ifelse(desvio > 0 & lag_espacial < 0, "HL", "LH")))
+  
+  quadrante_sig <- quadrante
+  quadrante_sig[dados_validos] <- ifelse(significancia, quadrante[dados_validos], "NS")
+  quadrante_sig[!dados_validos] <- "Sem Dados"
+  
+  # Resumo da distribuição
+  cat("Distribuição de LISA:\n")
+  print(table(quadrante_sig, useNA = "ifany"))
+  cat("\n")
+  
+  # Adicionar ao mapa
+  mapa_ano$lisa_class <- factor(quadrante_sig, 
+                                levels = c("HH", "LL", "HL", "LH", "NS", "Sem Dados"))
+  
+  # Retornar dados para análise adicional
+  return(list(
+    mapa = mapa_ano,
+    dados_ano = dados_ano,
+    lisa = lisa,
+    quadrante = quadrante_sig,
+    dados_validos = dados_validos
+  ))
+}
+```
+
+```{r}
+# Executar análise LISA para cada ano (TODOS OS MUNICÍPIOS)
+anos_analise <- 2015:2020
+resultados_lisa_completo <- list()
+
+for (ano_i in anos_analise) {
+  resultados_lisa_completo[[paste0("ano_", ano_i)]] <- 
+    calcular_lisa_completo(ano_i, dados, mapa_ce, listw_ce)
+}
+```
+
+## 3.4 Visualizações Combinadas: Moran I + LISA (por ano)
+
+```{r fig.height=8, fig.width=16}
+# Definir cores para LISA
+cores_lisa <- c("HH" = "#d73027", 
+                "LL" = "#4575b4", 
+                "HL" = "#fee090", 
+                "LH" = "#91cf60", 
+                "NS" = "#f0f0f0",
+                "Sem Dados" = "#cccccc")
+
+# Criar visualizações combinadas para cada ano
+for (ano_i in anos_analise) {
+  
+  cat("\n=== Gerando visualização combinada para", ano_i, "===\n")
+  
+  # Layout: 1 linha, 2 colunas
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 2))
+  
+  # PAINEL 1: Gráfico de dispersão de Moran I
+  crime_ano <- dados %>%
+    filter(ano == ano_i) %>%
+    arrange(cod) %>%
+    pull(letal)
+  
+  moran_i_valor <- resultados_moran_anual[resultados_moran_anual$ano == ano_i, "moran_i"]
+  p_valor <- resultados_moran_anual[resultados_moran_anual$ano == ano_i, "p_value"]
+  
+  moran.plot(crime_ano, listw_ce,
+             labels = FALSE,
+             xlab = "Taxa CVLI",
+             ylab = "Lag Espacial",
+             main = sprintf("Moran's I (Ano %d)\nI = %.3f, p < %.4f", 
+                          ano_i, moran_i_valor, p_valor),
+             pch = 16,
+             col = rgb(0, 0, 1, 0.4),
+             cex = 1.2,
+             quiet = TRUE)
+  
+  # PAINEL 2: Mapa LISA
+  mapa_ano <- resultados_lisa_completo[[paste0("ano_", ano_i)]]$mapa
+  
+  plot(st_geometry(mapa_ano), 
+       col = cores_lisa[as.character(mapa_ano$lisa_class)],
+       main = sprintf("Clusters Espaciais - LISA (Ano %d)", ano_i),
+       border = "black", 
+       lwd = 0.3)
+  
+  legend("topright", 
+         legend = c("HH (Alto-Alto)", "LL (Baixo-Baixo)", 
+                    "HL (Alto-Baixo)", "LH (Baixo-Alto)", 
+                    "NS (Não-Sig.)"),
+         fill = cores_lisa,
+         cex = 0.7,
+         bg = "white")
+  
+  par(mfrow = c(1, 1))
+}
+```
+
+```{r}
+# ======================================================================
+# 3.4 EXTRA (COMPLEMENTAR): SALVAR PAINÉIS MORAN+LISA E JUNTAR EM 1 IMAGEM
+# ======================================================================
+
+# Pacotes para juntar imagens
+library(magick)
+
+# Pasta de saída
+dir_out <- "figuras_moran_lisa"
+dir.create(dir_out, showWarnings = FALSE)
+
+# Função: desenha o painel (Moran | LISA) em BASE graphics
+plot_painel_moran_lisa <- function(ano_i, dados, resultados_moran_anual, resultados_lisa_completo,
+                                   listw_ce, cores_lisa) {
+
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 2))
+
+  # -------- Painel 1: Moran scatterplot
+  crime_ano <- dados %>%
+    filter(ano == ano_i) %>%
+    arrange(cod) %>%
+    pull(letal)
+
+  moran_i_valor <- resultados_moran_anual[resultados_moran_anual$ano == ano_i, "moran_i"]
+  p_valor <- resultados_moran_anual[resultados_moran_anual$ano == ano_i, "p_value"]
+
+  moran.plot(crime_ano, listw_ce,
+             labels = FALSE,
+             xlab = "Taxa CVLI",
+             ylab = "Lag Espacial",
+             main = sprintf("Moran's I (Ano %d)\nI = %.3f, p = %.4f",
+                            ano_i, moran_i_valor, p_valor),
+             pch = 16,
+             col = rgb(0, 0, 1, 0.4),
+             cex = 1.2,
+             quiet = TRUE)
+
+  # -------- Painel 2: Mapa LISA
+  mapa_ano <- resultados_lisa_completo[[paste0("ano_", ano_i)]]$mapa
+
+  plot(st_geometry(mapa_ano),
+       col = cores_lisa[as.character(mapa_ano$lisa_class)],
+       main = sprintf("Clusters Espaciais - LISA (Ano %d)", ano_i),
+       border = "black",
+       lwd = 0.3)
+
+  legend("topright",
+         legend = c("HH (Alto-Alto)", "LL (Baixo-Baixo)",
+                    "HL (Alto-Baixo)", "LH (Baixo-Alto)",
+                    "NS (Não-Sig.)"),
+         fill = c(cores_lisa["HH"], cores_lisa["LL"], cores_lisa["HL"],
+                  cores_lisa["LH"], cores_lisa["NS"]),
+         cex = 0.75,
+         bg = "white")
+
+  par(mfrow = c(1, 1))
+}
+
+# ---------- 1) Salvar 1 PNG por ano (Moran|LISA)
+arquivos_png <- c()
+
+for (ano_i in anos_analise) {
+
+  arq <- file.path(dir_out, paste0("painel_moran_lisa_", ano_i, ".png"))
+  arquivos_png <- c(arquivos_png, arq)
+
+  png(filename = arq, width = 2200, height = 900, res = 200)
+  plot_painel_moran_lisa(ano_i, dados, resultados_moran_anual, resultados_lisa_completo,
+                         listw_ce, cores_lisa)
+  dev.off()
+}
+
+# ---------- 2) Juntar TODOS em uma única imagem (empilhada)
+imgs <- image_read(arquivos_png)
+
+# Empilha verticalmente (stack = TRUE)
+img_final <- image_append(imgs, stack = TRUE)
+
+# Salvar imagem final
+arq_final <- file.path(dir_out, "PAINEL_MORAN_LISA_2015_2020.png")
+image_write(img_final, path = arq_final, format = "png")
+
+```
+
+
+
+## 3.5 Mapas LISA lado a lado (todos os anos)
+
+```{r fig.height=10, fig.width=16}
+# Visualização comparativa: Mapas LISA de todos os anos (2 x 3)
+par(mfrow = c(2, 3), mar = c(1, 1, 2, 1))
+
+for (ano_i in anos_analise) {
+  mapa_ano <- resultados_lisa_completo[[paste0("ano_", ano_i)]]$mapa
+  
+  plot(st_geometry(mapa_ano), 
+       col = cores_lisa[as.character(mapa_ano$lisa_class)],
+       main = sprintf("LISA %d", ano_i),
+       border = "black", 
+       lwd = 0.3)
+}
+
+# Adicionar legenda no último painel
+legend("right", 
+       legend = c("HH", "LL", "HL", "LH", "NS", "S/D"),
+       fill = cores_lisa,
+       cex = 1.2,
+       title = "Clusters")
+
+par(mfrow = c(1, 1))
+```
+
+## 3.6 Análise Temporal dos Clusters LISA
+
+```{r}
+cat("\n=== EVOLUÇÃO TEMPORAL DOS CLUSTERS ESPACIAIS (TODOS OS MUNICÍPIOS) ===\n\n")
+
+evolucao_clusters <- data.frame()
+
+for (ano_i in anos_analise) {
+  quadrantes <- resultados_lisa_completo[[paste0("ano_", ano_i)]]$quadrante
+  
+  contagem <- data.frame(
+    Ano = ano_i,
+    HH = sum(quadrantes == "HH", na.rm = TRUE),
+    LL = sum(quadrantes == "LL", na.rm = TRUE),
+    HL = sum(quadrantes == "HL", na.rm = TRUE),
+    LH = sum(quadrantes == "LH", na.rm = TRUE),
+    NS = sum(quadrantes == "NS", na.rm = TRUE),
+    Sem_Dados = sum(quadrantes == "Sem Dados" | is.na(quadrantes))
+  )
+  
+  evolucao_clusters <- rbind(evolucao_clusters, contagem)
+}
+
+print(evolucao_clusters)
+```
+
+```{r fig.height=6, fig.width=14}
+# Gráficos da evolução temporal
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 2))
+
+# Gráfico 1: Clusters significativos
+plot(evolucao_clusters$Ano, evolucao_clusters$HH, type = "b", 
+     col = "#d73027", lwd = 2.5, pch = 16, 
+     ylim = c(0, max(c(evolucao_clusters$HH, evolucao_clusters$LL)) + 3),
+     xlab = "Ano", ylab = "Número de Municípios", 
+     main = "Evolução dos Clusters Espaciais Significativos",
+     cex = 1.3)
+lines(evolucao_clusters$Ano, evolucao_clusters$LL, type = "b", 
+      col = "#4575b4", lwd = 2.5, pch = 16, cex = 1.3)
+lines(evolucao_clusters$Ano, evolucao_clusters$HL, type = "b", 
+      col = "#fee090", lwd = 2, pch = 15, cex = 1.1)
+lines(evolucao_clusters$Ano, evolucao_clusters$LH, type = "b", 
+      col = "#91cf60", lwd = 2, pch = 15, cex = 1.1)
+
+legend("topleft", 
+       legend = c("HH (Alto-Alto)", "LL (Baixo-Baixo)", 
+                  "HL (Alto-Baixo)", "LH (Baixo-Alto)"),
+       col = c("#d73027", "#4575b4", "#fee090", "#91cf60"),
+       lwd = 2.5, 
+       pch = c(16, 16, 15, 15),
+       cex = 0.9)
+
+# Gráfico 2: Proporção de significância
+total_com_dados <- evolucao_clusters$HH + evolucao_clusters$LL + 
+                   evolucao_clusters$HL + evolucao_clusters$LH + 
+                   evolucao_clusters$NS
+
+prop_sig <- 100 * (evolucao_clusters$HH + evolucao_clusters$LL + 
+                   evolucao_clusters$HL + evolucao_clusters$LH) / total_com_dados
+
+plot(evolucao_clusters$Ano, prop_sig, type = "b", 
+     col = "darkgreen", lwd = 2.5, pch = 16, cex = 1.3,
+     xlab = "Ano", ylab = "% de Municípios", 
+     main = "Proporção de Clusters LISA Significativos",
+     ylim = c(0, max(prop_sig) + 5))
+
+# Adicionar linha de referência
+abline(h = mean(prop_sig), lty = 2, col = "gray50")
+text(2017, mean(prop_sig) + 2, 
+     sprintf("Média: %.1f%%", mean(prop_sig)), 
+     col = "gray30", cex = 0.9)
+
+par(mfrow = c(1, 1))
+```
+
+## 3.7 Municípios com LISA significativo (tabela detalhada)
+
+```{r}
+cat("\n=== MUNICÍPIOS COM CLUSTERS ESPACIAIS SIGNIFICATIVOS ===\n\n")
+
+for (ano_i in anos_analise) {
+  
+  cat("\n", paste(rep("-", 70), collapse = ""), "\n")
+  cat("ANO:", ano_i, "\n")
+  cat(paste(rep("-", 70), collapse = ""), "\n\n")
+  
+  resultado_ano <- resultados_lisa_completo[[paste0("ano_", ano_i)]]
+  dados_ano <- resultado_ano$dados_ano
+  lisa <- resultado_ano$lisa
+  dados_validos <- resultado_ano$dados_validos
+  
+  # Criar vetor de p-values completo
+  p_values <- rep(NA, sum(dados_validos))
+  p_values[1:nrow(lisa)] <- lisa[, 5]
+  
+  # Tabela de significância local
+  lisa_sig <- data.frame(
+    Municipio = dados_ano$municipio,
+    Cod = dados_ano$cod,
+    Taxa_CVLI = round(dados_ano$letal, 2),
+    LISA = resultado_ano$quadrante[dados_validos],
+    P_value = round(p_values, 4)
+  ) %>% 
+    filter(LISA %in% c("HH", "LL", "HL", "LH")) %>%
+    arrange(P_value)
+  
+  if (nrow(lisa_sig) > 0) {
+    print(lisa_sig, row.names = FALSE)
+    cat("\nTotal de municípios significativos:", nrow(lisa_sig), "\n")
+  } else {
+    cat("Nenhum cluster LISA significativo identificado neste ano.\n")
+  }
+}
+```
+
+# 4. BALANCEAMENTO DO PAINEL (PARA MODELOS ECONOMÉTRICOS)
+
+```{r}
+cat("\n=== BALANCEAMENTO DO PAINEL ===\n")
+cat("Agora vamos balancear o painel removendo municípios com dados faltantes\n")
+cat("para permitir a estimação dos modelos espaciais SAR e SEM.\n\n")
+
+# Variáveis críticas do modelo
+vars_criticas <- c('letal', 'divorcio', 'densp', 'urb', 'gov', 'ifdm', 'prop_jovem')
+anos <- 2015:2020
+
+# Filtrar: apenas anos de interesse, sem NAs nas variáveis críticas
+dados_limpo <- dados %>%
+  filter(ano %in% anos) %>%
+  filter(if_all(all_of(vars_criticas), ~ !is.na(.)))
+
+# Identificar municípios com painel completo (6 anos)
+mun_completo <- dados_limpo %>%
+  group_by(municipio) %>%
+  summarise(n_anos = n(), .groups = "drop") %>%
+  filter(n_anos == length(anos)) %>%
+  pull(municipio)
+
+# Manter apenas municípios com painel balanceado
+dados_bal <- dados_limpo %>%
+  filter(municipio %in% mun_completo) %>%
+  arrange(municipio, ano)
+
+cat("Municípios no dataset original:", n_distinct(dados$municipio), "\n")
+cat("Municípios após remover NAs:", n_distinct(dados_limpo$municipio), "\n")
+cat("Municípios com painel balanceado:", n_distinct(dados_bal$municipio), "\n\n")
+
+# Verificar balanceamento
+painel_check <- dados_bal %>%
+  group_by(ano) %>%
+  summarise(n_mun = n_distinct(municipio), .groups = "drop")
+
+cat("Observações por ano no painel balanceado:\n")
+print(painel_check)
+
+if (all(painel_check$n_mun == n_distinct(dados_bal$municipio))) {
+  cat("\n✓ PAINEL PERFEITAMENTE BALANCEADO!\n")
+} else {
+  cat("\n✗ Ainda há desbalanceamento\n")
+}
+```
+
+# 5. MODELOS ECONOMÉTRICOS ESPACIAIS (PAINEL BALANCEADO)
+
+## 5.1 Preparação espacial do painel balanceado
+
+```{r}
+# Preparar dados espaciais apenas para municípios do painel balanceado
+mun_keep_cod <- unique(dados_bal$cod)
+mapa_bal <- mapa_ce %>% 
+  filter(cod %in% mun_keep_cod) %>% 
+  arrange(cod)
+
+# Matriz de vizinhança para painel balanceado
+nb_bal <- poly2nb(mapa_bal, queen = TRUE)
+listw_bal <- nb2listw(nb_bal, style = "W", zero.policy = TRUE)
+
+cat("Municípios no painel balanceado:", nrow(mapa_bal), "\n")
+cat("Municípios com vizinhos:", sum(card(nb_bal) > 0), "\n\n")
+
+# Converter para pdata.frame
+dados_pnl <- pdata.frame(dados_bal, index = c('municipio', 'ano'))
+```
+
+## 5.2 Modelo Painel com Efeitos Fixos Two-Way
+
+```{r}
+cat("\n=== MODELO 1: PAINEL COM EF TWO-WAY ===\n")
+
+dados_pnl$inv_pc = dados_pnl$desp / dados_pnl$pop_total
+dados_pnl$txdiv = dados_pnl$divorcio / dados_pnl$pop_total * 10000
+dados_bal$inv_pc = dados_bal$desp / dados_bal$pop_total
+dados_bal$txdiv = dados_bal$divorcio / dados_bal$pop_total * 10000
+
+mod_painel <- plm(letal ~ log(txdiv + 1) + log(densp) + log(urb) + log(inv_pc) + prop_jovem + ifdm,
+                  data = dados_pnl,
+                  model = 'within',
+                  effect = 'twoways')
+summary(mod_painel)
+```
+
+## especificades
+
+```{r}
+mod_random <- plm(letal ~ log(txdiv + 1) + log(densp) + log(urb) + log(inv_pc) + prop_jovem + ifdm,
+                  data = dados_pnl,
+                  model = 'random',
+                  effect = 'twoways',
+                  random.method="walhus")
+summary(mod_random)
+
+phtest(mod_painel, mod_random)
+```
+
+## 5.3 Modelo SAR (Spatial Lag)
+
+```{r}
+cat("\n=== MODELO 2: ESPACIAL SAR (LAG) ===\n")
+tryCatch({
+  mod_sar <- spml(letal ~ log(txdiv + 1) + log(densp) + log(urb) + log(inv_pc) + prop_jovem + ifdm,
+                  data = dados_pnl,
+                  listw = listw_bal,
+                  model = 'within',
+                  effect = 'twoways',
+                  lag = TRUE,
+                  spatial.error = "none",
+                  zero.policy = TRUE)
+  summary(mod_sar)
+}, error = function(e) cat("SAR erro:", e$message, "\n"))
+```
+
+## 5.4 Modelo SEM (Spatial Error)
+
+```{r}
+cat("\n=== MODELO 3: ESPACIAL SEM (ERROR) ===\n")
+tryCatch({
+  mod_sem <- spml(letal ~ log(txdiv + 1) + log(densp) + log(urb) + log(inv_pc) + prop_jovem + ifdm,
+                  data = dados_pnl,
+                  listw = listw_bal,
+                  model = 'within',
+                  effect = 'twoways',
+                  lag = FALSE,
+                  spatial.error = "b",
+                  zero.policy = TRUE)
+  summary(mod_sem)
+}, error = function(e) cat("SEM erro:", e$message, "\n"))
+```
+
+## 5.5 Comparação de Modelos
+
+```{r}
+# Comparar modelos com stargazer
+tryCatch({
+  stargazer(mod_painel, mod_sar, mod_sem, 
+            type = "text", 
+            digits = 4,
+            title = "Comparação de Modelos: Painel, SAR e SEM",
+            column.labels = c("Two-Way FE", "SAR", "SEM"))
+}, error = function(e) {
+  cat("Não foi possível gerar tabela comparativa com todos os modelos.\n")
+  cat("Verifique se os modelos SAR e SEM foram estimados corretamente.\n")
+})
+```
+
+# 6. DIAGNÓSTICOS E TESTES ADICIONAIS
+
+## 6.1 Testes de autocorrelação e heterocedasticidade
+
+```{r}
+cat("\n=== DIAGNÓSTICOS DO MODELO PAINEL ===\n\n")
+
+# Teste de Wooldridge (autocorrelação serial)
+cat("Teste de Wooldridge para autocorrelação serial:\n")
+pwartest(mod_painel)
+
+# Teste de Breusch-Pagan (heterocedasticidade)
+cat("\nTeste de Breusch-Pagan para heterocedasticidade:\n")
+bptest(mod_painel)
+```
+
+## 6.2 Coeficientes robustos
+
+```{r}
+# Coeficientes com erros-padrão robustos
+cat("\n=== COEFICIENTES COM ERROS-PADRÃO ROBUSTOS ===\n")
+robust_se <- coeftest(mod_painel, 
+                     vcov = vcovHC(mod_painel, 
+                                  type = "HC1", 
+                                  method = "arellano",
+                                  cluster = "group"))
+print(robust_se)
+```
+
+## 6.3 Teste de multicolinearidade
+
+```{r}
+cat("\n=== TESTE DE MULTICOLINEARIDADE (VIF) ===\n")
+
+mod_ols <- lm(letal ~ log(txdiv + 1) + log(densp) + log(urb) + log(inv_pc) + prop_jovem + ifdm, 
+              data = dados_bal)
+print(vif(mod_ols))
+```
+
+# RESUMO DA ANÁLISE
+
+```{r}
+cat("\n", paste(rep("=", 80), collapse = ""), "\n")
+cat("RESUMO DA ANÁLISE ESPACIAL\n")
+cat(paste(rep("=", 80), collapse = ""), "\n\n")
+
+cat("1. DADOS ORIGINAIS:\n")
+cat("   - Total de municípios:", n_distinct(dados$municipio), "\n")
+cat("   - Período analisado: 2015-2020\n")
+cat("   - Total de observações:", nrow(dados), "\n\n")
+
+cat("2. ANÁLISE ESPACIAL (TODOS OS MUNICÍPIOS):\n")
+cat("   - Municípios no shapefile:", nrow(mapa_ce), "\n")
+cat("   - Moran's I global (média):", round(moran_geral$estimate[1], 4), "\n")
+cat("   - P-value:", format(moran_geral$p.value, scientific = FALSE), "\n\n")
+
+cat("3. PAINEL BALANCEADO (MODELOS ECONOMÉTRICOS):\n")
+cat("   - Municípios no painel balanceado:", n_distinct(dados_bal$municipio), "\n")
+cat("   - Anos no painel:", length(anos), "\n")
+cat("   - Total de observações:", nrow(dados_bal), "\n\n")
+
+cat("4. CLUSTERS LISA (MÉDIA 2015-2020):\n")
+media_clusters <- colMeans(evolucao_clusters[, c("HH", "LL", "HL", "LH", "NS")])
+cat("   - Média HH (Alto-Alto):", round(media_clusters["HH"], 1), "municípios\n")
+cat("   - Média LL (Baixo-Baixo):", round(media_clusters["LL"], 1), "municípios\n")
+cat("   - Média HL (Alto-Baixo):", round(media_clusters["HL"], 1), "municípios\n")
+cat("   - Média LH (Baixo-Alto):", round(media_clusters["LH"], 1), "municípios\n")
+cat("   - Média NS (Não Significativo):", round(media_clusters["NS"], 1), "municípios\n\n")
+
+cat(paste(rep("=", 80), collapse = ""), "\n")
+cat("FIM DA ANÁLISE\n")
+cat(paste(rep("=", 80), collapse = ""), "\n")
+```
